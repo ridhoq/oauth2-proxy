@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,11 +23,11 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/pkg/apis/sessions"
 	"github.com/oauth2-proxy/oauth2-proxy/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/pkg/sessions/cookie"
+	"github.com/oauth2-proxy/oauth2-proxy/pkg/upstream"
 	"github.com/oauth2-proxy/oauth2-proxy/pkg/validation"
 	"github.com/oauth2-proxy/oauth2-proxy/providers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/websocket"
 )
 
 const (
@@ -40,135 +39,6 @@ const (
 
 func init() {
 	logger.SetFlags(logger.Lshortfile)
-
-}
-
-type WebSocketOrRestHandler struct {
-	restHandler http.Handler
-	wsHandler   http.Handler
-}
-
-func (h *WebSocketOrRestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Upgrade") == "websocket" {
-		h.wsHandler.ServeHTTP(w, r)
-	} else {
-		h.restHandler.ServeHTTP(w, r)
-	}
-}
-
-func TestWebSocketProxy(t *testing.T) {
-	handler := WebSocketOrRestHandler{
-		restHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(200)
-			hostname, _, _ := net.SplitHostPort(r.Host)
-			w.Write([]byte(hostname))
-		}),
-		wsHandler: websocket.Handler(func(ws *websocket.Conn) {
-			defer ws.Close()
-			var data []byte
-			err := websocket.Message.Receive(ws, &data)
-			if err != nil {
-				t.Fatalf("err %s", err)
-				return
-			}
-			err = websocket.Message.Send(ws, data)
-			if err != nil {
-				t.Fatalf("err %s", err)
-			}
-		}),
-	}
-	backend := httptest.NewServer(&handler)
-	defer backend.Close()
-
-	backendURL, _ := url.Parse(backend.URL)
-
-	opts := baseTestOptions()
-	var auth hmacauth.HmacAuth
-	opts.PassHostHeader = true
-	proxyHandler := NewWebSocketOrRestReverseProxy(backendURL, opts, auth)
-	frontend := httptest.NewServer(proxyHandler)
-	defer frontend.Close()
-
-	frontendURL, _ := url.Parse(frontend.URL)
-	frontendWSURL := "ws://" + frontendURL.Host + "/"
-
-	ws, err := websocket.Dial(frontendWSURL, "", "http://localhost/")
-	if err != nil {
-		t.Fatalf("err %s", err)
-	}
-	request := []byte("hello, world!")
-	err = websocket.Message.Send(ws, request)
-	if err != nil {
-		t.Fatalf("err %s", err)
-	}
-	var response = make([]byte, 1024)
-	websocket.Message.Receive(ws, &response)
-	if err != nil {
-		t.Fatalf("err %s", err)
-	}
-	if g, e := string(request), string(response); g != e {
-		t.Errorf("got body %q; expected %q", g, e)
-	}
-
-	getReq, _ := http.NewRequest("GET", frontend.URL, nil)
-	res, _ := http.DefaultClient.Do(getReq)
-	bodyBytes, _ := ioutil.ReadAll(res.Body)
-	backendHostname, _, _ := net.SplitHostPort(backendURL.Host)
-	if g, e := string(bodyBytes), backendHostname; g != e {
-		t.Errorf("got body %q; expected %q", g, e)
-	}
-}
-
-func TestNewReverseProxy(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		hostname, _, _ := net.SplitHostPort(r.Host)
-		w.Write([]byte(hostname))
-	}))
-	defer backend.Close()
-
-	backendURL, _ := url.Parse(backend.URL)
-	backendHostname, backendPort, _ := net.SplitHostPort(backendURL.Host)
-	backendHost := net.JoinHostPort(backendHostname, backendPort)
-	proxyURL, _ := url.Parse(backendURL.Scheme + "://" + backendHost + "/")
-
-	proxyHandler := NewReverseProxy(proxyURL, &options.Options{FlushInterval: time.Second})
-	setProxyUpstreamHostHeader(proxyHandler, proxyURL)
-	frontend := httptest.NewServer(proxyHandler)
-	defer frontend.Close()
-
-	getReq, _ := http.NewRequest("GET", frontend.URL, nil)
-	res, _ := http.DefaultClient.Do(getReq)
-	bodyBytes, _ := ioutil.ReadAll(res.Body)
-	if g, e := string(bodyBytes), backendHostname; g != e {
-		t.Errorf("got body %q; expected %q", g, e)
-	}
-}
-
-func TestEncodedSlashes(t *testing.T) {
-	var seen string
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		seen = r.RequestURI
-	}))
-	defer backend.Close()
-
-	b, _ := url.Parse(backend.URL)
-	proxyHandler := NewReverseProxy(b, &options.Options{FlushInterval: time.Second})
-	setProxyDirector(proxyHandler)
-	frontend := httptest.NewServer(proxyHandler)
-	defer frontend.Close()
-
-	f, _ := url.Parse(frontend.URL)
-	encodedPath := "/a%2Fb/?c=1"
-	getReq := &http.Request{URL: &url.URL{Scheme: "http", Host: f.Host, Opaque: encodedPath}}
-	_, err := http.DefaultClient.Do(getReq)
-	if err != nil {
-		t.Fatalf("err %s", err)
-	}
-	if seen != encodedPath {
-		t.Errorf("got bad request %q expected %q", seen, encodedPath)
-	}
 }
 
 func TestRobotsTxt(t *testing.T) {
@@ -547,7 +417,13 @@ func TestBasicAuthPassword(t *testing.T) {
 		w.Write([]byte(payload))
 	}))
 	opts := baseTestOptions()
-	opts.Upstreams = append(opts.Upstreams, providerServer.URL)
+	opts.UpstreamServers = options.Upstreams{
+		{
+			ID:   providerServer.URL,
+			Path: "/",
+			URI:  providerServer.URL,
+		},
+	}
 	// The CookieSecret must be 32 bytes in order to create the AES
 	// cipher.
 	opts.Cookie.Secret = "xyzzyplughxyzzyplughxyzzyplughxp"
@@ -713,7 +589,7 @@ type PassAccessTokenTest struct {
 
 type PassAccessTokenTestOptions struct {
 	PassAccessToken bool
-	ProxyUpstream   string
+	ProxyUpstream   options.Upstream
 }
 
 func NewPassAccessTokenTest(opts PassAccessTokenTestOptions) *PassAccessTokenTest {
@@ -736,9 +612,15 @@ func NewPassAccessTokenTest(opts PassAccessTokenTestOptions) *PassAccessTokenTes
 		}))
 
 	t.opts = baseTestOptions()
-	t.opts.Upstreams = append(t.opts.Upstreams, t.providerServer.URL)
-	if opts.ProxyUpstream != "" {
-		t.opts.Upstreams = append(t.opts.Upstreams, opts.ProxyUpstream)
+	t.opts.UpstreamServers = options.Upstreams{
+		{
+			ID:   t.providerServer.URL,
+			Path: "/",
+			URI:  t.providerServer.URL,
+		},
+	}
+	if opts.ProxyUpstream.ID != "" {
+		t.opts.UpstreamServers = append(t.opts.UpstreamServers, opts.ProxyUpstream)
 	}
 	// The CookieSecret must be 32 bytes in order to create the AES
 	// cipher.
@@ -842,7 +724,11 @@ func TestForwardAccessTokenUpstream(t *testing.T) {
 func TestStaticProxyUpstream(t *testing.T) {
 	patTest := NewPassAccessTokenTest(PassAccessTokenTestOptions{
 		PassAccessToken: true,
-		ProxyUpstream:   "static://200/static-proxy",
+		ProxyUpstream: options.Upstream{
+			ID:     "static-proxy",
+			Path:   "/static-proxy",
+			Static: true,
+		},
 	})
 
 	defer patTest.Close()
@@ -1338,7 +1224,13 @@ func TestAuthSkippedForPreflightRequests(t *testing.T) {
 	defer upstream.Close()
 
 	opts := baseTestOptions()
-	opts.Upstreams = append(opts.Upstreams, upstream.URL)
+	opts.UpstreamServers = options.Upstreams{
+		{
+			ID:   upstream.URL,
+			Path: "/",
+			URI:  upstream.URL,
+		},
+	}
 	opts.SkipAuthPreflight = true
 	validation.Validate(opts)
 
@@ -1395,7 +1287,13 @@ func NewSignatureTest() *SignatureTest {
 	upstream := httptest.NewServer(
 		http.HandlerFunc(authenticator.Authenticate))
 	upstreamURL, _ := url.Parse(upstream.URL)
-	opts.Upstreams = append(opts.Upstreams, upstream.URL)
+	opts.UpstreamServers = options.Upstreams{
+		{
+			ID:   upstream.URL,
+			Path: "/",
+			URI:  upstream.URL,
+		},
+	}
 
 	providerHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"access_token": "my_auth_token"}`))
@@ -1464,7 +1362,7 @@ func (st *SignatureTest) MakeRequestWithExpectedKey(method, body, key string) {
 	}
 	// This is used by the upstream to validate the signature.
 	st.authenticator.auth = hmacauth.NewHmacAuth(
-		crypto.SHA1, []byte(key), SignatureHeader, SignatureHeaders)
+		crypto.SHA1, []byte(key), upstream.SignatureHeader, upstream.SignatureHeaders)
 	proxy.ServeHTTP(st.rw, req)
 }
 
@@ -1812,7 +1710,13 @@ func Test_noCacheHeadersDoesNotExistsInResponseHeadersFromUpstream(t *testing.T)
 	t.Cleanup(upstream.Close)
 
 	opts := baseTestOptions()
-	opts.Upstreams = []string{upstream.URL}
+	opts.UpstreamServers = options.Upstreams{
+		{
+			ID:   upstream.URL,
+			Path: "/",
+			URI:  upstream.URL,
+		},
+	}
 	opts.SkipAuthRegex = []string{".*"}
 	_ = validation.Validate(opts)
 	proxy, err := NewOAuthProxy(opts, func(email string) bool {
