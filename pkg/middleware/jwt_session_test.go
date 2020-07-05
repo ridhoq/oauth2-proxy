@@ -377,44 +377,4 @@ Nnc3a3lGVWFCNUMxQnNJcnJMTWxka1dFaHluYmI4Ongtb2F1dGgtYmFzaWM=`
 			}),
 		)
 	})
-
-	Context("splitAuthHeader", func() {
-		type splitAuthTableInput struct {
-			header             string
-			expectedErr        error
-			expectedTokenType  string
-			expectedTokenValue string
-		}
-
-		DescribeTable("with a header value",
-			func(in splitAuthTableInput) {
-				tt, tv, err := splitAuthHeader(in.header)
-				if in.expectedErr != nil {
-					Expect(err).To(MatchError(in.expectedErr))
-				} else {
-					Expect(err).ToNot(HaveOccurred())
-				}
-				Expect(tt).To(Equal(in.expectedTokenType))
-				Expect(tv).To(Equal(in.expectedTokenValue))
-			},
-			Entry("Bearer abcdef", splitAuthTableInput{
-				header:             "Bearer abcdef",
-				expectedErr:        nil,
-				expectedTokenType:  "Bearer",
-				expectedTokenValue: "abcdef",
-			}),
-			Entry("Bearer", splitAuthTableInput{
-				header:             "Bearer",
-				expectedErr:        errors.New("invalid authorization header: \"Bearer\""),
-				expectedTokenType:  "",
-				expectedTokenValue: "",
-			}),
-			Entry("Bearer abc def", splitAuthTableInput{
-				header:             "Bearer abc def",
-				expectedErr:        errors.New("invalid authorization header: \"Bearer abc def\""),
-				expectedTokenType:  "",
-				expectedTokenValue: "",
-			}),
-		)
-	})
 })
